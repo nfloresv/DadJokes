@@ -1,51 +1,257 @@
-name: Demo Pipeline
+name: Code analisys and deploy
 
 # Runs on every push and every pull request to main
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch:
 
 jobs:
-  build:
-    name: 1. Build
+  # ---------------------------------------------------------------
+  # SAST 1: CodeQL (GitHub native). Results appear in Security > Code scanning
+  # ---------------------------------------------------------------
+  codeql:
+    name: SAST - CodeQL
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # upload results to Code scanning
+      actions: read
     steps:
       - name: Download the code
         uses: actions/checkout@v4
 
-      - name: Build message
-        run: |
-          echo "🔨 Starting build..."
-          echo "Project: Chistes de Papá"
-          echo "Branch: ${{ github.ref_name }}"
-          echo "Author: ${{ github.actor }}"
-          echo "✅ Build finished (simulated)"
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript # covers script.js and inline JS
+          queries: security-and-quality
+          build-mode: none
 
-      - name: Show project files
-        run: ls -R
+      - name: Run CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:javascript-typescript'
 
-  test:
-    name: 2. Test
+  # ---------------------------------------------------------------
+  # SAST 2: Semgrep (OSS rules, no account needed). Complements CodeQL
+  # ---------------------------------------------------------------
+  semgrep:
+    name: SAST - Semgrep
     runs-on: ubuntu-latest
-    needs: build        # waits for the build job to succeed
+    permissions:
+      contents: read
+      security-events: write
+    container:
+      image: semgrep/semgrep:latest
     steps:
-      - name: Test message
-        run: |
-          echo "🧪 Running tests..."
-          echo "Test 1: index.html loads... OK"
-          echo "Test 2: menu links work... OK"
-          echo "Test 3: jokes.json is valid... OK"
-          echo "✅ All tests passed (simulated)"
+      - name: Download the code
+        uses: actions/checkout@v4
 
+      - name: Run Semgrep (fails the job on findings)
+        continue-on-error: true
+        run: |
+          semgrep scan \
+            --config p/default \
+            --config p/javascript \
+            --config p/secrets \
+            --sarif --output semgrep.sarif
+
+      - name: Upload SARIF to Code scanning
+        if: always() && hashFiles('semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  # ---------------------------------------------------------------
+  # Build the site package
+  # ---------------------------------------------------------------
+  build:
+    name: Prepare site
+    runs-on: ubuntu-latest
+    needs: [codeql, semgrep]
+    steps:
+      - name: Download the code
+        uses: actions/checkout@v4
+
+      - name: Copy only the site files
+        run: |
+          mkdir _site
+          cp index.html script.js jokes.json users.json _site/
+          cp -r pages _site/
+          echo "Files to publish:"
+          ls -R _site
+
+      - name: Keep a copy for DAST
+        uses: actions/upload-artifact@v4
+        with:
+          name: site-for-dast
+          path: _site
+          retention-days: 1
+
+      - name: Configure Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
+
+      - name: Upload site package
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  # ---------------------------------------------------------------
+  # DAST pre-deploy: serve the built site locally and scan it with ZAP
+  # ---------------------------------------------------------------
+  dast-local:
+    name: DAST - ZAP (pre-deploy)
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+    steps:
+      - name: Download the code (for ZAP rules file)
+        uses: actions/checkout@v4
+
+      - name: Download built site
+        uses: actions/download-artifact@v4
+        with:
+          name: site-for-dast
+          path: _site
+
+      - name: Serve the site locally
+        run: |
+          cd _site
+          nohup python3 -m http.server 8080 > ../server.log 2>&1 &
+          for i in $(seq 1 15); do
+            curl -sf http://localhost:8080/ > /dev/null && echo "Server is up" && exit 0
+            sleep 1
+          done
+          echo "Server did not start" && cat ../server.log && exit 1
+
+      - name: Run ZAP baseline scan
+        run: |
+          mkdir -p zap-out && chmod 777 zap-out
+          RULES=""
+          if [ -f .zap/rules.tsv ]; then
+            cp .zap/rules.tsv zap-out/rules.tsv
+            RULES="-c rules.tsv"
+          fi
+          set +e
+          docker run --rm --network host \
+            -v "$PWD/zap-out:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t http://localhost:8080 \
+              -r zap-report.html -J zap-report.json -w zap-report.md \
+              $RULES
+          CODE=$?
+          set -e
+          echo "ZAP exit code: $CODE"
+          # 0 = clean, 1 = FAIL alerts, 2 = WARN alerts only, 3 = scan error
+          if [ "$CODE" -eq 1 ] || [ "$CODE" -eq 3 ]; then
+            echo "::error::ZAP found FAIL-level alerts or errored. See the report artifact."
+            exit 1
+          fi
+          if [ "$CODE" -eq 2 ]; then
+            echo "::warning::ZAP reported warnings (non-blocking). See the report artifact."
+          fi
+
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report-local
+          path: zap-out/
+          retention-days: 14
+
+  # ---------------------------------------------------------------
+  # Publish (only after the pre-deploy DAST passes)
+  # ---------------------------------------------------------------
   deploy:
-    name: 3. Deploy
+    name: Publish
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    needs: test         # waits for the test job to succeed
+    needs: [build, dast-local]
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - name: Deploy message
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Done
+        run: echo "🎉 Site published at ${{ steps.deployment.outputs.page_url }}"
+
+  # ---------------------------------------------------------------
+  # DAST post-deploy: scan the real live URL (includes the headers
+  #    GitHub Pages actually serves). Report-only, never rolls back.
+  # ---------------------------------------------------------------
+  dast-live:
+    name: DAST - ZAP (live site)
+    if: always() && (needs.deploy.result == 'success')
+    needs: [deploy]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download the code (for ZAP rules file)
+        uses: actions/checkout@v4
+
+      - name: Resolve target URL
+        id: target
         run: |
-          echo "🚀 Deploying..."
-          echo "No real server is used in this demo."
-          echo "🎉 Pipeline finished successfully (simulated)"
+          URL="${{ needs.deploy.outputs.page_url }}"
+          if [ -z "$URL" ]; then
+            # Scheduled runs: use the repo's Pages URL, or set repo variable PAGES_URL
+            URL="${{ vars.PAGES_URL }}"
+          fi
+          if [ -z "$URL" ]; then
+            OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+            REPO="${GITHUB_REPOSITORY#*/}"
+            URL="https://${OWNER}.github.io/${REPO}/"
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Scanning $URL"
+
+      - name: Run ZAP baseline scan
+        run: |
+          mkdir -p zap-out && chmod 777 zap-out
+          RULES=""
+          if [ -f .zap/rules.tsv ]; then
+            cp .zap/rules.tsv zap-out/rules.tsv
+            RULES="-c rules.tsv"
+          fi
+          set +e
+          docker run --rm \
+            -v "$PWD/zap-out:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t "${{ steps.target.outputs.url }}" \
+              -r zap-report.html -J zap-report.json -w zap-report.md \
+              $RULES
+          CODE=$?
+          set -e
+          echo "ZAP exit code: $CODE"
+          if [ "$CODE" -ne 0 ]; then
+            echo "::warning::ZAP live scan exit code $CODE. Review the report artifact."
+          fi
+
+      - name: Upload ZAP report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report-live
+          path: zap-out/
+          retention-days: 30
